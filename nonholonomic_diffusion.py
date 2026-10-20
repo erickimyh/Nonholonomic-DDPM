@@ -68,8 +68,9 @@ class NonholonomicDiffusionTrainer:
         self.t = self.make_time_grid(T, kappa, schedule, t0).to(device)   # (steps+1,)
         self.dt = self.t[1:] - self.t[:-1]                                  # (steps,)
         self.steps = len(self.dt)
+        self.t0 = t0
         self.j0 = self._index_at(t0)
-        self.t0 = self.t[self.j0].item()
+        self.t0_ = self.t[self.j0].item()  # actual first time
 
         if loss_weight == 'uniform':
             w = self.dt
