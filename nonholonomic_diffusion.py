@@ -1,4 +1,5 @@
 import copy
+import math
 from typing import Callable, Dict, Optional
 
 import torch
@@ -17,12 +18,12 @@ class NonholonomicDiffusionTrainer:
                  d: int = 3,
                  k: int = 2,
                  T: float = 5.0,
-                 steps: int = 100,
+                 kappa: float = 0.01,
+                 schedule: str = 'linear',
                  loss_type: str = 'ibp',
                  sigma: float = 0.1,
-                 t0: float = 0.01,
-                 b0: float = 0.1,
-                 b1: float = 10.0,
+                 t0: float = 1e-4,
+                 loss_weight: str = 'uniform',
                  learning_rate: float = 1e-3,
                  weight_decay: float = 1e-4,
                  per_sample_time: bool = True,
@@ -35,9 +36,18 @@ class NonholonomicDiffusionTrainer:
         g represents the k generating vector fields, mapping a space tensor x of shape (d,) to (k, d).
         g must be defined in such a way that we can call torch.vmap(g).
 
-        Time is discretised uniformly; reparametrisation encoded in the schedule beta(t).
+        Forward SDE is dX = G(X) dW on [0, T], discretised on a fixed grid self.t with step
+        sizes self.dt[j] = t[j+1] - t[j] <= kappa. `schedule` sets how steps shrink near t=0
+        (see make_time_grid); self.steps is the resulting number of steps.
 
         sigma: DSM noise level.
+        loss_weight: per-sample weight on the loss at sampled step j (j is uniform over steps).
+            'uniform'    : dt[j], i.e. uniform in time: the loss is a Riemann sum in time of
+                           the per-time loss.
+            'inverse_dt' : 1, i.e. time weighted by 1/dt (emphasises fine-step regions).
+            'inverse_t2' : dt[j] / t[j]^2.
+            dt-based weights are normalised by the length of the training interval, so
+            'uniform' weights average to 1.
         per_sample_time: if True each sample in a training batch is diffused to its OWN
             randomly-sampled stopping time, reducing gradient variance substantially.
         """
@@ -48,19 +58,24 @@ class NonholonomicDiffusionTrainer:
         self.g = torch.vmap(g)
         self.d = d
         self.k = k
-        self.steps = steps
         self.loss_type = loss_type
         self.sigma = sigma
         self.per_sample_time = per_sample_time
+        self.loss_weight = loss_weight
 
-        self.t = torch.linspace(0.0, 1.0, steps + 1, device=device)
-        self.dt = 1.0 / steps
-        self.t0 = t0
-        self.j_min = int(t0 * steps)
+        self.kappa = kappa
+        self.schedule = schedule
+        self.t = self.make_time_grid(T, kappa, schedule, t0).to(device)   # (steps+1,)
+        self.dt = self.t[1:] - self.t[:-1]                                  # (steps,)
+        self.steps = len(self.dt)
+        self.j0 = self._index_at(t0)
+        self.t0 = self.t[self.j0].item()
 
-        def beta_(t):
-            return b0 + t * (b1 - b0)
-        self.beta = beta_
+        if loss_weight == 'uniform':
+            w = self.dt
+        elif loss_weight == 'time-weighted':
+            w = self.dt * self.t[:-1]
+        self.loss_weight = w / w.mean()
 
         self.history: Dict = {
             'loss': [],
@@ -71,6 +86,39 @@ class NonholonomicDiffusionTrainer:
         self.best_ckpt = None
         self.min_loss = 1e10
         self.min_epoch = None
+
+    # ── Time grid ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def make_time_grid(T: float, kappa: float, schedule: str, t0: float) -> torch.Tensor:
+        """
+        Grid 0 = t[0] < ... < t[steps] = T with every step <= kappa.
+          'constant'    : dt = kappa throughout.
+          'linear'      : dt grows linearly with step index up to kappa, reached at t ~ 1.
+          'exponential' : Benton et al. (2023). Steps <= kappa from 0 to t0, then dt[j] = kappa * t[j]
+                          (geometric growth) until t ~ 1.
+        All schedules then take steps of at most kappa up to T.
+        """
+        ts = [0.0]
+        if schedule == 'linear':
+            n_ramp = max(1, round(2 / kappa))          
+            for j in range(n_ramp):
+                ts.append(ts[-1] + kappa * (j + 1) / n_ramp)
+        elif schedule == 'exponential':
+            # reach t0 in steps <= kappa (needs t0 > 0), then grow geometrically
+            ts = np.linspace(0.0, t0, math.ceil(t0 / kappa - 1e-6) + 1).tolist()
+            while ts[-1] * (1 + kappa) < 1.0:
+                ts.append(ts[-1] * (1 + kappa))
+        elif schedule != 'constant':
+            raise ValueError(f"Unknown schedule: {schedule!r}")
+        ts = [t for t in ts if t < T]                  # in case T is inside the ramp
+        n_rest = math.ceil((T - ts[-1]) / kappa - 1e-6)
+        ts += np.linspace(ts[-1], T, n_rest + 1)[1:].tolist()
+        return torch.tensor(ts, dtype=torch.float32)
+
+    def _index_at(self, t: float) -> int:
+        """Index of the first grid point >= t."""
+        return int(torch.searchsorted(self.t, torch.tensor(t, device=self.t.device)))
 
     # ── Forward process ───────────────────────────────────────────────────────
 
@@ -95,8 +143,7 @@ class NonholonomicDiffusionTrainer:
         for j in range(max_steps):
             active = (steps_vec > j).to(x.dtype).unsqueeze(-1)   # (m, 1)
             noise = torch.randn(x.shape[:-1] + (self.k,), device=x.device)
-            dx = (torch.sqrt(self.beta(self.t[j]) * self.dt)
-                  * torch.einsum('mkd,mk->md', self.g(x), noise))
+            dx = torch.sqrt(self.dt[j]) * torch.einsum('mkd,mk->md', self.g(x), noise)
             x = x + active * dx
             x = torch.remainder(x, 1)
         return x
@@ -105,23 +152,29 @@ class NonholonomicDiffusionTrainer:
 
     def backward_process(self, x: torch.Tensor, model: nn.Module = None,
                          t0: float = 0.0, gamma: float = 0.0,
-                         stride: int = 1) -> torch.Tensor:
+                         stride: int = 1, return_trajectory: bool = False):
         """
         x: (m, d) initial points (typically uniform noise).
+        return_trajectory: if True, return (x, ts, xs) where xs[i] is the (m, d) state at
+                time ts[i], from the start time T down to the final time, inclusive.
         gamma: diffusion parameter (0 = probability flow ODE, 1 = full reverse SDE).
         stride: coarsen integration by taking a step every `stride` grid points; useful
-                for cheap evaluation during training (stride=1 = exact).
+                for cheap evaluation during training (stride=1 = full grid).
+        Each step is forward Euler in reverse time: the model is evaluated at the time
+        being stepped from, t[j + stride], and x moves to t[j].
         """
         if model is None:
             model = self.model
 
         x = torch.FloatTensor(x).to(self.device)
-        j0 = max(int(t0 * self.steps), self.j_min)
+        j0 = max(self._index_at(t0), self.j0)
         js = list(range(j0, self.steps, stride))[::-1]
-        dt_eff = stride * self.dt
+        ts, xs = [float(self.t[-1])], [x.detach().cpu()]
 
         for j in js:
-            t = self.t[j]
+            j_next = min(j + stride, self.steps)
+            t = self.t[j_next]                      # x is currently at time t[j_next]
+            dt = self.t[j_next] - self.t[j]
             u = model(x, t * torch.ones(x.shape[0], device=self.device))  # (m, k)
             if self.loss_type == 'dsm':
                 u = u / self.sigma
@@ -129,9 +182,14 @@ class NonholonomicDiffusionTrainer:
             v = torch.einsum('mkd, mk -> md', gx, u)
             noise = torch.einsum('mkd,mk -> md', gx, torch.randn_like(u))
             x = (x
-                 + ((1.0 + gamma) / 2) * v * self.beta(t) * dt_eff
-                 + torch.sqrt(gamma * self.beta(t) * dt_eff) * noise)
+                 + ((1.0 + gamma) / 2) * v * dt
+                 + torch.sqrt(gamma * dt) * noise)
             x = torch.remainder(x, 1)
+            if return_trajectory:
+                ts.append(float(self.t[j]))
+                xs.append(x.detach().cpu())
+        if return_trajectory:
+            return x, ts, xs
         return x
 
     # ── IBP divergence term ───────────────────────────────────────────────────
@@ -161,9 +219,9 @@ class NonholonomicDiffusionTrainer:
         m = x.shape[0]
 
         if self.per_sample_time:
-            j = torch.randint(self.j_min, self.steps, (m,), device=self.device)
+            j = torch.randint(self.j0, self.steps, (m,), device=self.device)
         else:
-            j = torch.randint(self.j_min, self.steps, (1,), device=self.device)
+            j = torch.randint(self.j0, self.steps, (1,), device=self.device)
         x = self.forward_process(x, j)
         t = self.t[j]
 
@@ -173,16 +231,18 @@ class NonholonomicDiffusionTrainer:
             u_eps = self.model(y, t)                               # (m, k)
             # target s_j ~ -(1/sigma) g_j(y)·eps, shape (m, k)
             score_eps = -torch.einsum('mkd, md -> mk', self.g(y), eps) / self.sigma
-            loss = torch.mean(0.5 * torch.norm(u_eps - score_eps, dim=-1) ** 2)
+            loss = 0.5 * torch.norm(u_eps - score_eps, dim=-1) ** 2   # (m,)
 
         elif self.loss_type == 'ibp':
             score = self.model(x, t)                               # (m, k)
             L2_score = 0.5 * torch.norm(score, dim=-1) ** 2       # (m,)
             div_score = self.compute_div(x, t)
-            loss = torch.mean(L2_score + div_score)
+            loss = L2_score + div_score                            # (m,)
 
         else:
             raise ValueError(f"Unknown loss_type: {self.loss_type!r}")
+
+        loss = torch.mean(loss * self.loss_weight[j])
 
         self.optimizer.zero_grad()
         loss.backward()

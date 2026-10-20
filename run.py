@@ -66,6 +66,14 @@ def make_sphere(N: int, **_) -> torch.Tensor:
     x = 0.25 * x + 0.5
     return torch.tensor(x, dtype=torch.float32)
 
+def make_circle(N: int, **_) -> torch.Tensor:
+    """Uniform samples on the circle in xy-plane of radius 0.25 centred at (0.5, 0.5, 0)."""
+    x = np.random.randn(N, 2)
+    x /= np.linalg.norm(x, axis=1, keepdims=True)
+    x = 0.25 * x + 0.5
+    x = np.concatenate([x, 0.5 * np.ones((N, 1))], axis=1)
+    return torch.tensor(x, dtype=torch.float32)
+
 def make_dirac(N: int, **_) -> torch.Tensor:
     """Point mass at (0.5, 0.5, 0.5)."""
     return 0.5 * torch.ones(N, 3)
@@ -78,6 +86,7 @@ TARGET_REGISTRY = {
     'sphere': make_sphere,
     'dirac':  make_dirac,
     'uniform': make_uniform,
+    'circle': make_circle,
 }
 
 
@@ -90,12 +99,22 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Core experiment parameters (explicitly requested)
-    p.add_argument('--N',          type=int,   default=2000,
+    p.add_argument('--N',          type=int,   default=5000,
                    help="Number of training samples drawn from the target distribution.")
     p.add_argument('--epochs',     type=int,   default=1000,
                    help="Number of training epochs.")
-    p.add_argument('--steps',      type=int,   default=1000,
-                   help="Forward-process Euler-Maruyama discretisation steps.")
+    p.add_argument('--T',          type=float, default=5.0,
+                   help="Forward-process horizon.")
+    p.add_argument('--kappa',      type=float, default=0.01,
+                   help="Maximum time step.")
+    p.add_argument('--schedule',   type=str,   default='exponential',
+                   choices=['constant', 'linear', 'exponential'],
+                   help="Step-size schedule near t=0: constant, linear ramp in step index, "
+                        "or exponential decay.")
+    p.add_argument('--loss-weight', type=str,   default='uniform',
+                   choices=['uniform', 'time-weighted'],
+                   help="Per-sample loss weight over time: uniform in time (Riemann sum), "
+                        " or t dt (Song et al.).")
     p.add_argument('--g',          type=str,   default='unicycle',
                    choices=list(G_REGISTRY),
                    help="Vector field controlling the nonholonomic constraint.")
@@ -113,27 +132,30 @@ def parse_args() -> argparse.Namespace:
     # Training hyperparameters
     p.add_argument('--lr',         type=float, default=1e-3,  help="Adam learning rate.")
     p.add_argument('--batch-size', type=int,   default=64,    help="Minibatch size.")
-    p.add_argument('--b0',         type=float, default=0.1,   help="Variance schedule β(0).")
-    p.add_argument('--b1',         type=float, default=10.0,  help="Variance schedule β(1).")
-    p.add_argument('--t0',         type=float, default=0.01,
-                   help="Minimum diffusion time (floor for j_min).")
+    p.add_argument('--t0',         type=float, default=1e-4,
+                   help="Early-stopping time. t is the accumulated noise variance, so "
+                        "samples are blurred by std ~sqrt(t0) per driven coordinate.")
+    p.add_argument('--no-log-time', action='store_true',
+                   help="Embed t instead of log(t) in the score model.")
     p.add_argument('--no-lr-schedule', action='store_true',
                    help="Disable cosine annealing LR schedule.")
 
     # Evaluation
-    p.add_argument('--eval-every',  type=int,   default=10,
+    p.add_argument('--eval-every',  type=int,   default=0,
                    help="Compute sliced W2 every N epochs during training (0 = disable).")
     p.add_argument('--eval-n',      type=int,   default=200,
                    help="Number of backward-process samples used per training eval.")
     p.add_argument('--eval-stride', type=int,   default=5,
                    help="Integration stride for cheap training-time backward process.")
-    p.add_argument('--ot-method',   type=str,   default='sinkhorn',
+    p.add_argument('--ot-method',   type=str,   default='exact',
                    choices=['exact', 'sinkhorn'],
                    help="OT solver for final torus-aware W2 evaluation. "
                         "'exact' uses POT network-simplex LP (precise, O(n^3) worst case); "
                         "'sinkhorn' is faster with a small controllable bias.")
 
     # W&B / output
+    p.add_argument('--verbose', action='store_true',
+                   help="Print training progress to console (in addition to W&B).")
     p.add_argument('--wandb-project', type=str, default='nonholonomic-diffusion',
                    help="W&B project name.")
     p.add_argument('--wandb-offline', action='store_true',
@@ -174,7 +196,7 @@ def main() -> None:
     # ── Run name and output directory ─────────────────────────────────────────
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
     run_name = args.run_name or (
-        f"{ts}_{args.g}_{args.loss_type}_{args.target}_N{args.N}_e{args.epochs}"
+        f"{ts}_{args.g}_{args.loss_type}_{args.target}_N{args.N}_e{args.epochs}_t0={args.t0}"
     )
     out_dir = Path('output') / run_name
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -212,6 +234,7 @@ def main() -> None:
     model = ScoreModel(
         input_dim=d,
         output_dim=k,
+        log_time=not args.no_log_time,
         hidden_dims=[64, 32, 32, 16],
     )
     n_params = sum(p.numel() for p in model.parameters())
@@ -222,15 +245,24 @@ def main() -> None:
     trainer = NonholonomicDiffusionTrainer(
         model, g_fn,
         d=d, k=k,
-        steps=args.steps,
+        T=args.T,
+        kappa=args.kappa,
+        schedule=args.schedule,
         t0=args.t0,
+        loss_weight=args.loss_weight,
         sigma=args.sigma,
         loss_type=args.loss_type,
-        b0=args.b0,
-        b1=args.b1,
         learning_rate=args.lr,
         per_sample_time=True,
     )
+    log.info(f"Time grid: {args.schedule}, {trainer.steps} steps, "
+             f"T={args.T}, kappa={args.kappa}, t0={args.t0} (index {trainer.j0})")
+    t_stop = float(trainer.t[trainer.j0])
+    if t_stop > 1.5 * args.t0:
+        log.warning(f"t0={args.t0} is not resolved by the '{args.schedule}' grid; "
+                    f"the backward process stops at t={t_stop:.2e}. Use a smaller "
+                    f"--kappa or the linear/exponential schedule.")
+    wandb.config.update({'steps': trainer.steps}, allow_val_change=True)
 
     # ── Epoch callback: W&B logging + timestamped console lines ───────────────
     def on_epoch_end(epoch: int, loss: float, history: dict) -> None:
@@ -257,7 +289,7 @@ def main() -> None:
         x0,
         epochs=args.epochs,
         batch_size=args.batch_size,
-        verbose=False,                      # suppress default prints; callback handles output
+        verbose=args.verbose,                   
         eval_every=args.eval_every or None,
         eval_n=args.eval_n,
         eval_stride=args.eval_stride,
@@ -302,36 +334,27 @@ def main() -> None:
     wandb.log({'charts/training_curves': wandb.Image(str(curves_path))})
     log.info(f"Training curves saved -> {curves_path}")
 
-    # ── Score field visualisation ─────────────────────────────────────────────
-    log.info("Generating score field visualisations...")
-    for t_vis in [0.8, 0.3, 0.1, 0.02]:
-        fig_score = visualize_score(trainer, t=t_vis, n=5)
-        score_path = out_dir / f'score_t{t_vis:.2f}.png'
-        fig_score.savefig(score_path, dpi=100)
-        plt.close(fig_score)
-        wandb.log({f'score/t={t_vis}': wandb.Image(str(score_path))})
-
     # ── Backward process sweep + torus W2 ────────────────────────────────────
+    # Evaluate Wasserstein distance between target distribution and backward-process samples at t=t0.
+    # Log this evaluation for both deterministic (gamma=0) and stochastic (gamma=1) backward processes.
     log.info(f"Running backward process sweep (OT method: {args.ot_method})...")
-    t_vals = [1.0, 0.5, 0.1, 0.05, 0.01]
     final_metrics: dict = {}
 
-    for t in t_vals:
+    for gamma in [0.0, 1.0]:
         xT = torch.rand(2000, d)
         x_gen = trainer.backward_process(
-            xT, model=trainer.best_ckpt, t0=t, gamma=0.0
+            xT, model=trainer.best_ckpt, gamma=gamma
         ).detach()
 
         w2 = wasserstein_torus(x_gen, x0, p=2, method=args.ot_method)
-        key = f"t0={t:.3f}"
-        final_metrics[f'eval/w2_torus_{key}'] = w2
-        log.info(f"  {key}  W2_torus ({args.ot_method}) = {w2:.4f}")
+        final_metrics[f'eval_gamma={gamma}/w2_torus'] = w2
+        log.info(f"gamma={gamma} | W2_torus ({args.ot_method}) = {w2:.4f}")
 
-        fig_scatter = scatter_3d(x_gen, title=f"t0={t}  |  W2 (torus) ≈ {w2:.4f}")
-        scatter_path = out_dir / f'backward_t{t:.3f}.png'
+        fig_scatter = scatter_3d(x_gen, title=f"gamma={gamma} | W2 (torus) ≈ {w2:.4f}")
+        scatter_path = out_dir / f'backward_gamma={gamma}.png'
         fig_scatter.savefig(scatter_path, dpi=120)
         plt.close(fig_scatter)
-        wandb.log({f'backward/t0={t}': wandb.Image(str(scatter_path))})
+        wandb.log({f'backward/gamma={gamma}': wandb.Image(str(scatter_path))})
 
     wandb.log(final_metrics)
     wandb.summary.update(final_metrics)

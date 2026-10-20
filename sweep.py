@@ -25,8 +25,8 @@ from pathlib import Path
 
 # Every combination of these values is run.
 GRID = {
-    'schedule': ['linear', 'exponential'],
-    'loss-weight': ['inverse_dt', 'uniform', 'inverse_t2'],
+    'schedule': ['exponential'],
+    'loss-weight': ['time-weighted'],
     't0': [1e-4, 1e-3],
 }
 

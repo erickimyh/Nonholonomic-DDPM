@@ -9,14 +9,17 @@ class ScoreModel(nn.Module):
     def __init__(self, 
                  input_dim: int = 2, # d
                  output_dim: int = 2, # d (standard) or k (nonholonomic)
-                 hidden_dims: List[int] = [64, 32, 16, 16], 
+                 hidden_dims: List[int] = [64, 64, 32, 16], 
                  time_emb_dim: int = 16,
+                 log_time: bool = True,
         ):
         """
             input_dim: Spatial dimension
             output_dim: Dimension of vector field output (d for standard diffusion, k for nonholonomic diffusion)
             hidden_layers: List of hidden layer sizes
             activations: List of activation functions for each hidden layer
+            log_time: embed log(t) instead of t, so that small times (e.g. 0.01 vs 0.02)
+                are as distinguishable as large ones
         """
         super(ScoreModel, self).__init__()
         
@@ -24,6 +27,7 @@ class ScoreModel(nn.Module):
         self.output_dim = output_dim
         self.hidden_dims = hidden_dims
         self.time_emb_dim = time_emb_dim
+        self.log_time = log_time
 
         # Layers
         layers = []
@@ -51,6 +55,8 @@ class ScoreModel(nn.Module):
 
     # sinusoidal time embedding
     def _time_embedding(self, t):
+        if self.log_time:
+            t = torch.log(t.clamp_min(1e-5)) 
         half = self.time_emb_dim // 2
         freqs = torch.exp(
             -math.log(10000) * torch.arange(half, device=t.device) / half
