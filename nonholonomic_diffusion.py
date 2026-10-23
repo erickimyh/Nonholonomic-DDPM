@@ -75,7 +75,7 @@ class NonholonomicDiffusionTrainer:
         if loss_weight == 'uniform':
             w = self.dt
         elif loss_weight == 'time-weighted':
-            w = self.dt * self.t[:-1]
+            w = self.dt * torch.max(self.t[:-1], torch.ones_like(self.dt))
         self.loss_weight = w / w.mean()
 
         self.history: Dict = {

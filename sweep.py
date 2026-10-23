@@ -25,8 +25,6 @@ from pathlib import Path
 
 # Every combination of these values is run.
 GRID = {
-    'schedule': ['exponential'],
-    'loss-weight': ['time-weighted'],
     't0': [1e-4, 1e-3],
 }
 
@@ -36,6 +34,8 @@ FIXED = {
     'epochs': 500,
     'N':      5000,
     'eval-every': 50, 
+    'schedule': 'exponential',
+    'loss-weight': 'time-weighted',
 }
 
 

@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """
-experiment.py — entry point for nonholonomic diffusion experiments.
+Trains a model to learn the score function of nonholonomic diffusion from target distribution.
+Plots the loss trajectory and Wasserstein distance between backward process and target to WandB.
 
 Usage examples
 --------------
-# IBP loss, sphere target, default hyperparameters:
-python experiment.py --loss-type ibp
-
-# DSM loss, more samples, offline W&B:
-python experiment.py --loss-type dsm --N 5000 --epochs 2000 --wandb-offline
+# More samples, offline W&B:
+python run.py --N 5000 --epochs 2000 --wandb-offline
 
 # Dirac-delta target, fast smoke test:
-python experiment.py --target dirac --N 2000 --epochs 50 --eval-every 10
+python run.py --target dirac --N 2000 --epochs 50 --eval-every 10
 
 Results are written to output/<run-name>/ and simultaneously streamed to W&B.
 """
@@ -34,61 +32,8 @@ import wandb
 
 from model import ScoreModel
 from nonholonomic_diffusion import NonholonomicDiffusionTrainer
-from utils import scatter_3d, visualize_score, sliced_wasserstein, wasserstein_torus
-
-
-# ── Vector field registry ────────────────────────────────────────────────────
-# Each entry maps a --g name to (function, d, k).
-# Add new vector fields here; experiment code below is field-agnostic.
-
-def g_unicycle(x: torch.Tensor) -> torch.Tensor:
-    """Unicycle on T^3: g1=(cos 2πx3, sin 2πx3, 0), g2=(0,0,1)."""
-    zero = torch.zeros_like(x[2])
-    one  = torch.ones_like(x[2])
-    g1 = torch.stack([torch.cos(2 * torch.pi * x[2]),
-                      torch.sin(2 * torch.pi * x[2]), zero])
-    g2 = torch.stack([zero, zero, one])
-    return torch.stack([g1, g2])
-
-
-G_REGISTRY = {
-    'unicycle': (g_unicycle, 3, 2),
-    # 'my_new_field': (g_my_new_field, d, k),
-}
-
-
-# ── Target distribution registry ─────────────────────────────────────────────
-
-def make_sphere(N: int, **_) -> torch.Tensor:
-    """Uniform samples on the sphere of radius 0.25 centred at (0.5, 0.5, 0.5)."""
-    x = np.random.randn(N, 3)
-    x /= np.linalg.norm(x, axis=1, keepdims=True)
-    x = 0.25 * x + 0.5
-    return torch.tensor(x, dtype=torch.float32)
-
-def make_circle(N: int, **_) -> torch.Tensor:
-    """Uniform samples on the circle in xy-plane of radius 0.25 centred at (0.5, 0.5, 0)."""
-    x = np.random.randn(N, 2)
-    x /= np.linalg.norm(x, axis=1, keepdims=True)
-    x = 0.25 * x + 0.5
-    x = np.concatenate([x, 0.5 * np.ones((N, 1))], axis=1)
-    return torch.tensor(x, dtype=torch.float32)
-
-def make_dirac(N: int, **_) -> torch.Tensor:
-    """Point mass at (0.5, 0.5, 0.5)."""
-    return 0.5 * torch.ones(N, 3)
-
-def make_uniform(N: int, **_) -> torch.Tensor:
-    """Uniform distribution on the torus [0,1)^3."""
-    return torch.rand(N, 3)
-
-TARGET_REGISTRY = {
-    'sphere': make_sphere,
-    'dirac':  make_dirac,
-    'uniform': make_uniform,
-    'circle': make_circle,
-}
-
+from utils import scatter_3d, wasserstein_torus
+from registry import G_REGISTRY, TARGET_REGISTRY
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
@@ -130,6 +75,8 @@ def parse_args() -> argparse.Namespace:
                    help="Target distribution to learn.")
 
     # Training hyperparameters
+    p.add_argument('--hidden-dims', nargs='+', type=int, default=[64, 32, 32, 16],
+                   help="Dimensions of hidden layers in neural network.")
     p.add_argument('--lr',         type=float, default=1e-3,  help="Adam learning rate.")
     p.add_argument('--batch-size', type=int,   default=64,    help="Minibatch size.")
     p.add_argument('--t0',         type=float, default=1e-4,
@@ -235,7 +182,7 @@ def main() -> None:
         input_dim=d,
         output_dim=k,
         log_time=not args.no_log_time,
-        hidden_dims=[64, 32, 32, 16],
+        hidden_dims=args.hidden_dims,
     )
     n_params = sum(p.numel() for p in model.parameters())
     log.info(f"Model parameters: {n_params:,}")
