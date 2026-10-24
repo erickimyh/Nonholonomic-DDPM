@@ -1,4 +1,5 @@
 output/
-__pycache/ 
- misc/
- .DS_Store
+__pycache__/ 
+misc/
+.DS_Store
+animate.py

@@ -4,7 +4,6 @@ from typing import Callable, Dict, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
 from torch.utils.data import TensorDataset, DataLoader
 
@@ -42,12 +41,9 @@ class NonholonomicDiffusionTrainer:
 
         sigma: DSM noise level.
         loss_weight: per-sample weight on the loss at sampled step j (j is uniform over steps).
-            'uniform'    : dt[j], i.e. uniform in time: the loss is a Riemann sum in time of
-                           the per-time loss.
-            'inverse_dt' : 1, i.e. time weighted by 1/dt (emphasises fine-step regions).
-            'inverse_t2' : dt[j] / t[j]^2.
-            dt-based weights are normalised by the length of the training interval, so
-            'uniform' weights average to 1.
+            'uniform'       : dt, i.e. the loss is a Riemann sum
+            'time-weighted' : min(t, 1) * dt
+            dt-based weights are normalised by the length of the training interval.
         per_sample_time: if True each sample in a training batch is diffused to its OWN
             randomly-sampled stopping time, reducing gradient variance substantially.
         """
@@ -68,6 +64,9 @@ class NonholonomicDiffusionTrainer:
         self.t = self.make_time_grid(T, kappa, schedule, t0).to(device)   # (steps+1,)
         self.dt = self.t[1:] - self.t[:-1]                                  # (steps,)
         self.steps = len(self.dt)
+
+        if t0 <= 0.0:
+            raise ValueError("Early stopping time t0 must be strictly positive.")
         self.t0 = t0
         self.j0 = self._index_at(t0)
         self.t0_ = self.t[self.j0].item()  # actual first time
@@ -75,7 +74,7 @@ class NonholonomicDiffusionTrainer:
         if loss_weight == 'uniform':
             w = self.dt
         elif loss_weight == 'time-weighted':
-            w = self.dt * torch.max(self.t[:-1], torch.ones_like(self.dt))
+            w = self.dt * torch.min(self.t[:-1], torch.ones_like(self.dt))
         self.loss_weight = w / w.mean()
 
         self.history: Dict = {
@@ -110,7 +109,7 @@ class NonholonomicDiffusionTrainer:
             ts = np.linspace(0.0, t0, math.ceil(t0 / kappa - 1e-6) + 1).tolist()
             while ts[-1] * (1 + kappa) < 1.0:
                 ts.append(ts[-1] * (1 + kappa))
-        elif schedule != 'constant':
+        else:
             raise ValueError(f"Unknown schedule: {schedule!r}")
         ts = [t for t in ts if t < T]                  # in case T is inside the ramp
         n_rest = math.ceil((T - ts[-1]) / kappa - 1e-6)
@@ -119,7 +118,7 @@ class NonholonomicDiffusionTrainer:
 
     def _index_at(self, t: float) -> int:
         """Index of the first grid point >= t."""
-        return int(torch.searchsorted(self.t, torch.tensor(t, device=self.t.device)))
+        return int(torch.searchsorted(self.t, torch.tensor(t, device=self.device)))
 
     # ── Forward process ───────────────────────────────────────────────────────
 
@@ -128,22 +127,22 @@ class NonholonomicDiffusionTrainer:
         x: (m, d) or (d,) promoted to (1, d).
         steps: int (shared for whole batch) or (m,) long tensor (per-sample).
         """
-        x = x.clone()
+        x = torch.as_tensor(x, dtype=torch.float32, device=self.device).clone()
         if len(x.shape) == 1:
             x = x.unsqueeze(0)
         m = x.shape[0]
 
         if isinstance(steps, int):
-            steps_vec = torch.full((m,), steps, device=x.device, dtype=torch.long)
+            steps_vec = torch.full((m,), steps, device=self.device, dtype=torch.long)
         else:
-            steps_vec = steps.to(device=x.device, dtype=torch.long)
+            steps_vec = steps.to(device=self.device, dtype=torch.long)
             if steps_vec.numel() == 1:
                 steps_vec = steps_vec.expand(m)
 
         max_steps = int(steps_vec.max().item()) if steps_vec.numel() > 0 else 0
         for j in range(max_steps):
             active = (steps_vec > j).to(x.dtype).unsqueeze(-1)   # (m, 1)
-            noise = torch.randn(x.shape[:-1] + (self.k,), device=x.device)
+            noise = torch.randn(x.shape[:-1] + (self.k,), device=self.device)
             dx = torch.sqrt(self.dt[j]) * torch.einsum('mkd,mk->md', self.g(x), noise)
             x = x + active * dx
             x = torch.remainder(x, 1)
@@ -167,7 +166,7 @@ class NonholonomicDiffusionTrainer:
         if model is None:
             model = self.model
 
-        x = torch.FloatTensor(x).to(self.device)
+        x = torch.as_tensor(x, dtype=torch.float32, device=self.device)
         j0 = max(self._index_at(t0), self.j0)
         js = list(range(j0, self.steps, stride))[::-1]
         ts, xs = [float(self.t[-1])], [x.detach().cpu()]
@@ -248,7 +247,7 @@ class NonholonomicDiffusionTrainer:
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
-        return loss
+        return loss.detach()
 
     # ── Training loop ─────────────────────────────────────────────────────────
 
@@ -276,12 +275,13 @@ class NonholonomicDiffusionTrainer:
             the end of every epoch, AFTER the sliced-W2 eval (if any). Use this to drive
             external logging (e.g. W&B) without importing it here.
         """
-        x_train = torch.FloatTensor(x_train).to(self.device)
+        x_train = torch.as_tensor(x_train, dtype=torch.float32, device=self.device)
         dataset = TensorDataset(x_train)
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
         if eval_x_ref is None:
             eval_x_ref = x_train
+        eval_x_ref = torch.as_tensor(eval_x_ref, dtype=torch.float32, device=self.device)
         if eval_t0 is None:
             eval_t0 = self.t0
 
@@ -314,7 +314,7 @@ class NonholonomicDiffusionTrainer:
                     x_gen = self.backward_process(x_init, t0=eval_t0,
                                                   gamma=0.0, stride=eval_stride)
                     idx = torch.randperm(eval_x_ref.shape[0],
-                                         device=eval_x_ref.device)[:eval_n]
+                                         device=self.device)[:eval_n]
                     sw = sliced_wasserstein(x_gen, eval_x_ref[idx], p=2)
                 self.history['sliced_w2'].append(sw.item())
                 self.history['sliced_w2_epoch'].append(epoch)

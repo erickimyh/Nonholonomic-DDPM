@@ -3,13 +3,11 @@ Grid sweep over run.py hyperparameters.
 
 Edit GRID / FIXED below, then:
 
-    python sweep.py                  # sequential
     python sweep.py --workers 4      # 4 runs at a time, 1 CPU thread each
     python sweep.py --dry-run        # print the commands without running them
 
 Each run is a separate `python run.py ...` subprocess, so W&B, logging and
-torch state never leak between runs. Boolean flags (e.g. wandb-offline) are
-passed as bare switches when their value is True and omitted when False.
+torch state never leak between runs. 
 """
 
 import argparse
@@ -26,16 +24,17 @@ from pathlib import Path
 # Every combination of these values is run.
 GRID = {
     't0': [1e-4, 1e-3],
+    'loss-weight': ['uniform', 'time-weighted']
 }
 
-# Passed unchanged to every run.
 FIXED = {
+    'g': 'unicycle',
+    'target': 'circle',
     'loss-type': 'ibp',
     'epochs': 500,
     'N':      5000,
     'eval-every': 50, 
     'schedule': 'exponential',
-    'loss-weight': 'time-weighted',
 }
 
 

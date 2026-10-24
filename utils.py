@@ -60,7 +60,9 @@ def wasserstein_torus(x: torch.Tensor, y: torch.Tensor,
             'sinkhorn' -> ot.sinkhorn2, entropic-regularised; faster, small bias
                           tunable via sinkhorn_reg.
     """
-    M = torus_cost_matrix(x, y, squared=(p == 2)).detach().cpu().numpy().astype(np.float64)
+    # POT runs on the CPU; moving both clouds there also avoids a device mismatch
+    x, y = x.detach().cpu(), y.detach().cpu()
+    M = torus_cost_matrix(x, y, squared=(p == 2)).numpy().astype(np.float64)
     a = np.ones(x.shape[0]) / x.shape[0]
     b = np.ones(y.shape[0]) / y.shape[0]
 

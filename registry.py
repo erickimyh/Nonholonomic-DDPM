@@ -28,7 +28,7 @@ def make_sphere(N: int, d: int = 3) -> torch.Tensor:
     return torch.tensor(x, dtype=torch.float32)
 
 def make_circle(N: int) -> torch.Tensor:
-    """Uniform samples on the circle in xy-plane of radius 0.25 centred at (0.5, 0.5, 0)."""
+    """Uniform samples on the circle in xy-plane of radius 0.25 centred at (0.5, 0.5, 0.5)."""
     x = np.random.randn(N, 2)
     x /= np.linalg.norm(x, axis=1, keepdims=True)
     x = 0.25 * x + 0.5

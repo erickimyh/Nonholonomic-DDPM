@@ -100,6 +100,11 @@ def parse_args() -> argparse.Namespace:
                         "'exact' uses POT network-simplex LP (precise, O(n^3) worst case); "
                         "'sinkhorn' is faster with a small controllable bias.")
 
+    # Hardware
+    p.add_argument('--device',     type=str,   default='auto',
+                   choices=['auto', 'cpu', 'cuda', 'mps'],
+                   help="Torch device. 'auto' uses CUDA if available, else CPU (MPS is opt-in).")
+
     # W&B / output
     p.add_argument('--verbose', action='store_true',
                    help="Print training progress to console (in addition to W&B).")
@@ -189,6 +194,10 @@ def main() -> None:
     wandb.config.update({'n_params': n_params}, allow_val_change=True)
 
     # ── Trainer ───────────────────────────────────────────────────────────────
+    device = args.device
+    if device == 'auto':
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    log.info(f"Device: {device}")
     trainer = NonholonomicDiffusionTrainer(
         model, g_fn,
         d=d, k=k,
@@ -201,6 +210,7 @@ def main() -> None:
         loss_type=args.loss_type,
         learning_rate=args.lr,
         per_sample_time=True,
+        device=device,
     )
     log.info(f"Time grid: {args.schedule}, {trainer.steps} steps, "
              f"T={args.T}, kappa={args.kappa}, t0={args.t0} (index {trainer.j0})")
@@ -208,7 +218,7 @@ def main() -> None:
     if t_stop > 1.5 * args.t0:
         log.warning(f"t0={args.t0} is not resolved by the '{args.schedule}' grid; "
                     f"the backward process stops at t={t_stop:.2e}. Use a smaller "
-                    f"--kappa or the linear/exponential schedule.")
+                    f"--kappa or the exponential schedule.")
     wandb.config.update({'steps': trainer.steps}, allow_val_change=True)
 
     # ── Epoch callback: W&B logging + timestamped console lines ───────────────
